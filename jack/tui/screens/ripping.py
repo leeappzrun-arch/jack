@@ -1,0 +1,437 @@
+"""Ripping screen — live VU, tracklist, artwork, progress.
+
+UI orchestration:
+
+- A `RipController` runs in a worker thread (see `jack.audio.recorder`).
+- Audio data never touches the UI thread: the controller emits
+  `ControllerEvent`s via the callback we pass in, and our handler funnels
+  each event through `app.call_from_thread` to mutate widgets safely.
+- A 10 Hz UI-side `set_interval` poll reads the latest RMS/peak from the
+  controller and re-renders the VU meter — cheaper than posting an event
+  per audio block.
+"""
+from __future__ import annotations
+
+import logging
+import math
+import threading
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from textual import on
+from textual.app import ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical
+from textual.reactive import reactive
+from textual.screen import Screen
+from textual.widgets import DataTable, Footer, Header, ProgressBar, Static
+
+from jack.audio.recorder import ControllerEvent, EventKind, RipController
+from jack.metadata.artwork import (
+    Artwork,
+    chafa_available,
+    fallback_art,
+    render_with_chafa,
+)
+from jack.state import Side, Track, TrackStatus
+from jack.tui.screens.complete import CompletionScreen
+from jack.tui.screens.flip import FlipModal
+
+if TYPE_CHECKING:
+    from jack.tui.app import JackApp
+
+logger = logging.getLogger(__name__)
+
+STATUS_ICON = {
+    TrackStatus.WAITING:   "·",
+    TrackStatus.RECORDING: "●",
+    TrackStatus.ENCODING:  "⚙",
+    TrackStatus.DONE:      "✓",
+    TrackStatus.WARNING:   "!",
+}
+
+
+def _fmt_dur(ms: int | None) -> str:
+    if not ms:
+        return "  --"
+    s = ms // 1000
+    return f"{s // 60:>2}:{s % 60:02d}"
+
+
+# ---------------------------------------------------------------------------
+# Custom VU widget
+# ---------------------------------------------------------------------------
+
+
+class VUMeter(Static):
+    """Horizontal text VU. Update via `set_levels(rms_db, peak_db)`."""
+
+    DEFAULT_CSS = """
+    VUMeter {
+        height: 3;
+        padding: 0 2;
+        content-align: left middle;
+    }
+    """
+
+    rms_db = reactive(-math.inf, layout=False)
+    peak_db = reactive(-math.inf, layout=False)
+
+    FLOOR_DB = -60.0
+    WIDTH = 50
+
+    def set_levels(self, rms_db: float, peak_db: float) -> None:
+        self.rms_db = rms_db
+        self.peak_db = peak_db
+
+    def watch_rms_db(self, _old: float, _new: float) -> None:
+        self.refresh()
+
+    def watch_peak_db(self, _old: float, _new: float) -> None:
+        self.refresh()
+
+    def render(self) -> str:
+        def cells(db: float) -> int:
+            if not math.isfinite(db):
+                return 0
+            frac = (db - self.FLOOR_DB) / (-self.FLOOR_DB)
+            return max(0, min(self.WIDTH, int(frac * self.WIDTH)))
+
+        rms_n = cells(self.rms_db)
+        peak_n = cells(self.peak_db)
+        # Two-layer bar: solid for RMS, lighter for peak hold.
+        bar_chars: list[str] = []
+        for i in range(self.WIDTH):
+            if i < rms_n:
+                # Color gradient via Rich markup: green, yellow, red zones.
+                if i >= int(self.WIDTH * 0.85):
+                    bar_chars.append("[red]█[/]")
+                elif i >= int(self.WIDTH * 0.7):
+                    bar_chars.append("[yellow]█[/]")
+                else:
+                    bar_chars.append("[green]█[/]")
+            elif i < peak_n:
+                bar_chars.append("[white]▏[/]")
+            else:
+                bar_chars.append("·")
+        bar = "".join(bar_chars)
+        rms_s = f"{self.rms_db:+6.1f}" if math.isfinite(self.rms_db) else "  -inf"
+        peak_s = f"{self.peak_db:+6.1f}" if math.isfinite(self.peak_db) else "  -inf"
+        return f"VU  {bar}  peak {peak_s} dB  rms {rms_s} dB"
+
+
+# ---------------------------------------------------------------------------
+# Ripping screen
+# ---------------------------------------------------------------------------
+
+
+class RippingScreen(Screen):
+    """Live rip view."""
+
+    BINDINGS = [
+        Binding("p", "toggle_pause", "Pause / Resume"),
+        Binding("f", "force_flip", "Flip Record"),
+        Binding("q", "quit_rip", "Stop & Quit"),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._controller: RipController | None = None
+        self._vu_timer = None
+        self._track_started_at: float | None = None
+        self._transitioned = False  # guard against double-pushing CompletionScreen
+
+    # ---- compose --------------------------------------------------------
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=False)
+        with Horizontal(id="rip-body"):
+            with Vertical(id="rip-left"):
+                yield Static("", id="artwork", markup=False)
+                yield Static("", id="album-info")
+            with Vertical(id="rip-right"):
+                yield Static("", id="side-label")
+                tracks_table = DataTable(id="tracks", cursor_type="row", zebra_stripes=True)
+                tracks_table.show_cursor = False
+                yield tracks_table
+        yield VUMeter(id="vu")
+        with Horizontal(id="progress-row"):
+            with Vertical(classes="progress-col"):
+                yield Static("Track", classes="progress-label")
+                yield ProgressBar(total=100, show_eta=False, show_percentage=True, id="track-progress")
+            with Vertical(classes="progress-col"):
+                yield Static("Overall", classes="progress-label")
+                yield ProgressBar(total=100, show_eta=False, show_percentage=True, id="overall-progress")
+        yield Static("", id="rip-status")
+        yield Footer()
+
+    # ---- mount ----------------------------------------------------------
+
+    def on_mount(self) -> None:
+        app: "JackApp" = self.app  # type: ignore[assignment]
+
+        # Album header info
+        self.query_one("#album-info", Static).update(
+            f"[b]{app.state.artist}[/b]\n{app.state.album}\n{app.state.date or ''}"
+        )
+        self._update_side_label()
+
+        # Tracklist
+        tbl = self.query_one("#tracks", DataTable)
+        tbl.add_columns("  ", "  #", "Title", "Expected", "Actual")
+        for t in app.state.tracks:
+            tbl.add_row(
+                STATUS_ICON[t.status],
+                f"{t.number:>2}",
+                t.title,
+                _fmt_dur(t.duration_ms),
+                _fmt_dur(t.actual_duration_ms),
+            )
+
+        # Artwork
+        self._render_artwork()
+
+        # Progress bars
+        self.query_one("#overall-progress", ProgressBar).update(
+            total=max(1, len(app.state.tracks)), progress=0
+        )
+
+        # Controller
+        self._controller = RipController(
+            state=app.state,
+            device_index=app.config.device_index,
+            sample_rate=app.config.sample_rate,
+            channels=app.config.channels,
+            threshold_db=app.config.silence_threshold_db,
+            silence_duration_s=app.config.silence_duration_s,
+            min_track_duration_s=app.config.min_track_duration_s,
+            output_dir=Path(app.config.output_dir),
+            artwork=app.artwork,
+            on_event=self._on_controller_event,
+        )
+        try:
+            self._controller.start()
+        except Exception as e:
+            logger.exception("controller start failed")
+            self.query_one("#rip-status", Static).update(
+                f"[red]Failed to start capture: {e}[/]"
+            )
+            return
+
+        # 10 Hz VU + track-progress refresh
+        self._vu_timer = self.set_interval(0.1, self._tick_ui)
+        self.query_one("#rip-status", Static).update(
+            f"Listening at {self._controller.sample_rate} Hz. Drop the needle and press play."
+        )
+
+    # ---- shutdown -------------------------------------------------------
+
+    def on_unmount(self) -> None:
+        if self._vu_timer is not None:
+            self._vu_timer.stop()
+        if self._controller is not None:
+            try:
+                self._controller.stop()
+            except Exception:
+                logger.exception("controller.stop failed during unmount")
+
+    # ---- artwork --------------------------------------------------------
+
+    def _render_artwork(self) -> None:
+        app: "JackApp" = self.app  # type: ignore[assignment]
+        widget = self.query_one("#artwork", Static)
+        if app.artwork is not None and chafa_available():
+            try:
+                widget.update(render_with_chafa(app.artwork.image_path, width=24, height=12))
+                return
+            except Exception:
+                logger.exception("chafa render failed")
+        widget.update(fallback_art())
+
+    def _update_side_label(self) -> None:
+        app: "JackApp" = self.app  # type: ignore[assignment]
+        self.query_one("#side-label", Static).update(
+            f"[b]SIDE {app.state.side.value}[/b]"
+        )
+
+    # ---- 10 Hz UI tick --------------------------------------------------
+
+    def _tick_ui(self) -> None:
+        if self._controller is None:
+            return
+        rms, peak = self._controller.vu_levels()
+        self.query_one("#vu", VUMeter).set_levels(rms, peak)
+
+        # Track progress based on elapsed actual frames vs expected ms.
+        app: "JackApp" = self.app  # type: ignore[assignment]
+        track = app.state.current_track()
+        track_bar = self.query_one("#track-progress", ProgressBar)
+        if track is not None and track.status == TrackStatus.RECORDING and track.duration_ms:
+            # The writer's frame count is the source of truth for actual elapsed
+            # length, but we don't have a stable handle to it here. Use a wall-
+            # clock approximation seeded at TRACK_STARTED instead.
+            import time
+            elapsed_ms = int((time.monotonic() - (self._track_started_at or time.monotonic())) * 1000)
+            pct = min(100, int(elapsed_ms / track.duration_ms * 100))
+            track_bar.update(total=100, progress=pct)
+        elif track is None or track.status == TrackStatus.WAITING:
+            track_bar.update(total=100, progress=0)
+
+    # ---- controller event bridge ----------------------------------------
+
+    def _on_controller_event(self, ev: ControllerEvent) -> None:
+        """May run on worker or UI thread (start/pause emit synchronously)."""
+        try:
+            self.app.call_from_thread(self._handle_event, ev)
+        except RuntimeError:
+            # Already on the UI thread — invoke directly.
+            self._handle_event(ev)
+
+    def _handle_event(self, ev: ControllerEvent) -> None:
+        # Late events can land after the screen starts unmounting (encoder
+        # pool finishing). Bail rather than NoMatches the widgets.
+        if not self.is_attached:
+            return
+        if ev.kind == EventKind.READY:
+            self._set_status("Listening...")
+        elif ev.kind == EventKind.TRACK_STARTED:
+            import time
+            self._track_started_at = time.monotonic()
+            self._refresh_track_row(ev.track_index)
+            self._set_status(f"Recording track {ev.track_index + 1}")
+        elif ev.kind == EventKind.TRACK_FINISHED:
+            self._refresh_track_row(ev.track_index)
+            self._bump_overall_progress()
+            if ev.message:
+                self._set_status(f"[yellow]Track {ev.track_index + 1} error: {ev.message}[/]")
+            else:
+                self._set_status(
+                    f"Wrote track {ev.track_index + 1} ({_fmt_dur(ev.actual_duration_ms)})"
+                )
+            self._maybe_transition_to_completion()
+        elif ev.kind == EventKind.SIDE_A_COMPLETE:
+            self._set_status("Side A complete — pausing for record flip.")
+            self._begin_flip_flow()
+        elif ev.kind == EventKind.PAUSED:
+            self._set_status("Paused.")
+        elif ev.kind == EventKind.RESUMED:
+            self._update_side_label()
+            self._set_status("Resumed.")
+        elif ev.kind == EventKind.STOPPED:
+            self._set_status("Stopped.")
+            # Step 9 will replace this with a transition to the completion screen.
+        elif ev.kind == EventKind.ERROR:
+            self._set_status(f"[red]Error: {ev.message}[/]")
+
+    # ---- helpers --------------------------------------------------------
+
+    def _refresh_track_row(self, idx: int | None) -> None:
+        if idx is None:
+            return
+        app: "JackApp" = self.app  # type: ignore[assignment]
+        if not (0 <= idx < len(app.state.tracks)):
+            return
+        t = app.state.tracks[idx]
+        tbl = self.query_one("#tracks", DataTable)
+        # Update individual cells. DataTable rows are keyed by position 0..N-1.
+        try:
+            tbl.update_cell_at((idx, 0), STATUS_ICON[t.status])
+            tbl.update_cell_at((idx, 4), _fmt_dur(t.actual_duration_ms))
+        except Exception:
+            logger.exception("failed to update track row %d", idx)
+
+    def _bump_overall_progress(self) -> None:
+        app: "JackApp" = self.app  # type: ignore[assignment]
+        done = sum(1 for t in app.state.tracks if t.status in (TrackStatus.DONE, TrackStatus.WARNING))
+        bar = self.query_one("#overall-progress", ProgressBar)
+        bar.update(total=max(1, len(app.state.tracks)), progress=done)
+
+    def _set_status(self, text: str) -> None:
+        self.query_one("#rip-status", Static).update(text)
+
+    def _maybe_transition_to_completion(self) -> None:
+        """If every track is in a terminal state, switch to the completion screen.
+
+        Controller shutdown joins worker + encoder pool. Running it on the UI
+        thread inside a `call_from_thread` callback deadlocks (the encoder
+        pool may still want to deliver events back to us). Defer to a thread.
+        """
+        if self._transitioned:
+            return
+        app: "JackApp" = self.app  # type: ignore[assignment]
+        terminal = {TrackStatus.DONE, TrackStatus.WARNING}
+        if not app.state.tracks:
+            return
+        if any(t.status not in terminal for t in app.state.tracks):
+            return
+        self._transitioned = True
+        if self._vu_timer is not None:
+            self._vu_timer.stop()
+        threading.Thread(
+            target=self._shutdown_and_switch,
+            name="jack-transition",
+            daemon=True,
+        ).start()
+
+    def _shutdown_and_switch(self) -> None:
+        """Worker-thread helper: drain controller, then switch screens on UI thread."""
+        controller = self._controller
+        self._controller = None  # so on_unmount skips a second stop()
+        if controller is not None:
+            try:
+                controller.stop()
+            except Exception:
+                logger.exception("controller.stop failed during transition")
+        try:
+            self.app.call_from_thread(self.app.switch_screen, CompletionScreen())
+        except RuntimeError:
+            # App is shutting down — nothing to switch to.
+            pass
+
+    # ---- flip flow ------------------------------------------------------
+
+    def _begin_flip_flow(self) -> None:
+        if self._controller is None:
+            return
+        self._controller.pause()
+
+        def _after(resumed: bool) -> None:
+            if not resumed:
+                return
+            if self._controller is None:
+                return
+            self._controller.resume_for_side_b()
+
+        self.app.push_screen(FlipModal(), _after)
+
+    # ---- actions --------------------------------------------------------
+
+    def action_toggle_pause(self) -> None:
+        if self._controller is None:
+            return
+        if self.app.state.side == Side.A and self.app.state.side_a_count and \
+                self.app.state.current_track_index >= self.app.state.side_a_count:
+            return
+        # Simple toggle — internally setting/clearing the paused event.
+        if self._controller._paused.is_set():
+            self._controller._paused.clear()
+            self._set_status("Resumed.")
+        else:
+            self._controller.pause()
+
+    def action_force_flip(self) -> None:
+        """Manual side flip (used when MB had no side info)."""
+        self._begin_flip_flow()
+
+    def action_quit_rip(self) -> None:
+        """Stop the rip and show the completion summary with whatever was done."""
+        if self._transitioned:
+            return
+        self._transitioned = True
+        if self._vu_timer is not None:
+            self._vu_timer.stop()
+        threading.Thread(
+            target=self._shutdown_and_switch,
+            name="jack-quit",
+            daemon=True,
+        ).start()

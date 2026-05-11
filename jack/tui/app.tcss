@@ -1,0 +1,179 @@
+/* Setup screen layout */
+
+SetupScreen {
+    layout: vertical;
+}
+
+#setup-grid {
+    padding: 1 2;
+    height: auto;
+}
+
+.row {
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+.label {
+    width: 10;
+    content-align: left middle;
+    color: $text-muted;
+}
+
+Input {
+    width: 1fr;
+}
+
+#status {
+    padding: 0 2;
+    height: 1;
+    color: $warning;
+}
+
+#results {
+    height: 12;
+    margin: 0 2;
+    border: solid $primary;
+}
+
+#begin {
+    margin: 1 2;
+}
+
+#search {
+    margin: 0 2;
+}
+
+DataTable > .datatable--header {
+    background: $primary 30%;
+}
+
+/* ----- Ripping screen ----- */
+
+RippingScreen {
+    layout: vertical;
+}
+
+#rip-body {
+    height: 1fr;
+    padding: 1 1;
+}
+
+#rip-left {
+    width: 32;
+    padding: 0 1;
+}
+
+#rip-right {
+    width: 1fr;
+    padding: 0 1;
+}
+
+#artwork {
+    height: 12;
+    margin-bottom: 1;
+}
+
+#album-info {
+    height: auto;
+    color: $text;
+}
+
+#side-label {
+    height: 1;
+    content-align: right middle;
+    color: $accent;
+    margin-bottom: 1;
+}
+
+#tracks {
+    height: 1fr;
+    border: solid $primary;
+}
+
+#progress-row {
+    height: 3;
+    padding: 0 2;
+}
+
+.progress-col {
+    width: 1fr;
+    height: 3;
+    padding: 0 1;
+}
+
+.progress-label {
+    height: 1;
+    color: $text-muted;
+}
+
+#rip-status {
+    height: 1;
+    padding: 0 2;
+    color: $text-muted;
+}
+
+/* ----- Flip modal ----- */
+
+FlipModal {
+    align: center middle;
+}
+
+#flip-dialog {
+    width: 50;
+    height: auto;
+    padding: 1 2;
+    background: $surface;
+    border: thick $warning;
+    content-align: center middle;
+}
+
+.flip-headline {
+    color: $warning;
+    text-style: bold;
+    content-align: center middle;
+}
+
+/* ----- Completion screen ----- */
+
+CompletionScreen {
+    layout: vertical;
+}
+
+#complete-body {
+    height: 1fr;
+    padding: 1 1;
+}
+
+#complete-left {
+    width: 32;
+    padding: 0 1;
+}
+
+#complete-right {
+    width: 1fr;
+    padding: 0 1;
+}
+
+#complete-artwork {
+    height: 12;
+}
+
+#complete-summary {
+    height: 5;
+    margin-bottom: 1;
+}
+
+#complete-tracks {
+    height: 1fr;
+    border: solid $primary;
+}
+
+#complete-buttons {
+    height: 3;
+    padding: 0 2;
+}
+
+#complete-buttons Button {
+    margin: 0 1;
+}

@@ -1,0 +1,49 @@
+{
+  "release-list": [
+    {
+      "id": "a1ad30cb-b8c4-4d68-9253-15b18fcde1d7",
+      "ext:score": "100",
+      "title": "The Dark Side of the Moon",
+      "artist-credit-phrase": "Pink Floyd",
+      "artist-credit": [{"name": "Pink Floyd", "artist": {"id": "83d91898-7763-47d7-b03b-b92132375c47", "name": "Pink Floyd"}}],
+      "date": "1973-03-01",
+      "country": "GB",
+      "medium-list": [
+        {"format": "12\" Vinyl", "track-count": 10}
+      ]
+    },
+    {
+      "id": "b0b1b7fe-1111-4444-aaaa-1234567890ab",
+      "ext:score": "95",
+      "title": "The Dark Side of the Moon",
+      "artist-credit-phrase": "Pink Floyd",
+      "date": "1993-03-30",
+      "country": "US",
+      "medium-list": [
+        {"format": "CD", "track-count": 10}
+      ]
+    },
+    {
+      "id": "c0c2c8ff-2222-5555-bbbb-2345678901bc",
+      "ext:score": "92",
+      "title": "The Dark Side of the Moon",
+      "artist-credit-phrase": "Pink Floyd",
+      "date": "2011-09-26",
+      "country": "GB",
+      "medium-list": [
+        {"format": "Vinyl", "track-count": 10}
+      ]
+    },
+    {
+      "id": "d0d3d9aa-3333-6666-cccc-3456789012cd",
+      "ext:score": "90",
+      "title": "The Dark Side of the Moon",
+      "artist-credit-phrase": "Pink Floyd",
+      "date": "2003-03-24",
+      "country": "GB",
+      "medium-list": [
+        {"format": "SACD", "track-count": 10}
+      ]
+    }
+  ]
+}

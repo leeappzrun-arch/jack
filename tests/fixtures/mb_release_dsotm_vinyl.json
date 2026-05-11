@@ -1,0 +1,29 @@
+{
+  "release": {
+    "id": "a1ad30cb-b8c4-4d68-9253-15b18fcde1d7",
+    "title": "The Dark Side of the Moon",
+    "artist-credit-phrase": "Pink Floyd",
+    "artist-credit": [{"name": "Pink Floyd", "artist": {"id": "83d91898-7763-47d7-b03b-b92132375c47", "name": "Pink Floyd"}}],
+    "date": "1973-03-01",
+    "country": "GB",
+    "medium-list": [
+      {
+        "position": "1",
+        "format": "12\" Vinyl",
+        "track-count": 10,
+        "track-list": [
+          {"position": "1", "number": "A1", "length": "67000", "recording": {"id": "r-01", "title": "Speak to Me",                "length": "67000"}},
+          {"position": "2", "number": "A2", "length": "163000","recording": {"id": "r-02", "title": "Breathe (In the Air)",       "length": "163000"}},
+          {"position": "3", "number": "A3", "length": "215000","recording": {"id": "r-03", "title": "On the Run",                 "length": "215000"}},
+          {"position": "4", "number": "A4", "length": "421000","recording": {"id": "r-04", "title": "Time",                       "length": "421000"}},
+          {"position": "5", "number": "A5", "length": "286000","recording": {"id": "r-05", "title": "The Great Gig in the Sky",   "length": "286000"}},
+          {"position": "6", "number": "B1", "length": "381000","recording": {"id": "r-06", "title": "Money",                      "length": "381000"}},
+          {"position": "7", "number": "B2", "length": "468000","recording": {"id": "r-07", "title": "Us and Them",                "length": "468000"}},
+          {"position": "8", "number": "B3", "length": "205000","recording": {"id": "r-08", "title": "Any Colour You Like",        "length": "205000"}},
+          {"position": "9", "number": "B4", "length": "230000","recording": {"id": "r-09", "title": "Brain Damage",               "length": "230000"}},
+          {"position": "10","number": "B5", "length": "126000","recording": {"id": "r-10", "title": "Eclipse",                    "length": "126000"}}
+        ]
+      }
+    ]
+  }
+}
