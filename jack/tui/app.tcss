@@ -32,16 +32,18 @@ Input {
 
 #results {
     height: 12;
-    margin: 0 2;
+    margin: 0 0 1 0;
     border: solid $primary;
 }
 
-#begin {
-    margin: 1 2;
+.button-row {
+    height: auto;
+    align-horizontal: right;
+    margin: 0 0 1 0;
 }
 
-#search {
-    margin: 0 2;
+#begin {
+    margin-top: 1;
 }
 
 DataTable > .datatable--header {

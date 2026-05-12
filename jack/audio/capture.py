@@ -26,6 +26,11 @@ BLOCKSIZE = 1024
 # than this we drop, log, and surface via `dropped_blocks`.
 QUEUE_MAXSIZE = 256
 
+# Live-monitor queue holds only a handful of blocks (~92 ms at 1024 frames/44.1 kHz).
+# Tight cap on purpose: monitor latency must stay low, and a stalled output
+# device must never backpressure the rip path.
+MONITOR_QUEUE_MAXSIZE = 4
+
 
 @dataclass(frozen=True)
 class DeviceInfo:
@@ -59,6 +64,30 @@ def list_usb_input_devices() -> list[DeviceInfo]:
     return [d for d in list_input_devices() if d.is_usb]
 
 
+@dataclass(frozen=True)
+class OutputDeviceInfo:
+    index: int
+    name: str
+    max_output_channels: int
+    default_samplerate: int
+
+
+def list_output_devices() -> list[OutputDeviceInfo]:
+    """All devices with at least one output channel."""
+    out: list[OutputDeviceInfo] = []
+    for idx, dev in enumerate(sd.query_devices()):
+        if dev["max_output_channels"] > 0:
+            out.append(
+                OutputDeviceInfo(
+                    index=idx,
+                    name=dev["name"],
+                    max_output_channels=dev["max_output_channels"],
+                    default_samplerate=int(dev["default_samplerate"]),
+                )
+            )
+    return out
+
+
 class CaptureStream:
     """Wraps `sd.InputStream`. Pushes float32 (frames, channels) blocks to `queue`.
 
@@ -74,6 +103,7 @@ class CaptureStream:
         blocksize: int = BLOCKSIZE,
         queue_maxsize: int = QUEUE_MAXSIZE,
         on_xrun: Callable[[str], None] | None = None,
+        monitor_device_index: int | None = None,
     ) -> None:
         self.device_index = device_index
         # Resolved at start() if None: falls back to the device's native rate.
@@ -86,6 +116,14 @@ class CaptureStream:
         self._lock = threading.Lock()
         self.dropped_blocks = 0
 
+        # Live monitor (optional). Same SR/channels as the input — no resampling.
+        self.monitor_device_index = monitor_device_index
+        self._monitor_stream: sd.OutputStream | None = None
+        self._monitor_queue: queue.Queue[np.ndarray] = queue.Queue(
+            maxsize=MONITOR_QUEUE_MAXSIZE
+        )
+        self.monitor_dropped = 0
+
     # PortAudio thread — keep this tight.
     def _callback(self, indata: np.ndarray, frames: int, time, status) -> None:
         if status:
@@ -97,17 +135,110 @@ class CaptureStream:
                     self._on_xrun(msg)
                 except Exception:
                     logger.exception("on_xrun handler failed")
+        # Copy once: PortAudio reuses the buffer after the callback returns,
+        # and both the rip queue and the monitor queue need their own ownership.
+        block = indata.copy()
         try:
-            # Copy: PortAudio reuses the buffer after the callback returns.
-            self.queue.put_nowait(indata.copy())
+            self.queue.put_nowait(block)
         except queue.Full:
             self.dropped_blocks += 1
             # Drop oldest to keep latency bounded.
             try:
                 self.queue.get_nowait()
-                self.queue.put_nowait(indata.copy())
+                self.queue.put_nowait(block)
             except (queue.Empty, queue.Full):
                 pass
+
+        # Monitor tee. Must never block the rip path: if the output stream
+        # stalls and the queue fills, we drop the monitor block silently.
+        if self._monitor_stream is not None:
+            try:
+                self._monitor_queue.put_nowait(block)
+            except queue.Full:
+                self.monitor_dropped += 1
+
+    # PortAudio thread (output side).
+    def _monitor_callback(self, outdata: np.ndarray, frames: int, time, status) -> None:
+        if status:
+            logger.warning("PortAudio monitor status: %s", str(status))
+        try:
+            block = self._monitor_queue.get_nowait()
+        except queue.Empty:
+            outdata.fill(0)
+            return
+        if block.shape == outdata.shape:
+            outdata[:] = block
+        elif block.shape[0] == frames and block.ndim == outdata.ndim:
+            # Channel-count mismatch (e.g. mono input → stereo output): duplicate.
+            if block.shape[1] == 1 and outdata.shape[1] >= 1:
+                outdata[:] = np.repeat(block, outdata.shape[1], axis=1)
+            else:
+                outdata.fill(0)
+        else:
+            outdata.fill(0)
+
+    def _open_monitor(self, sample_rate: int) -> None:
+        """Best-effort. Failure to open the monitor never fails the rip."""
+        if self.monitor_device_index is None:
+            return
+        dev = sd.query_devices(self.monitor_device_index)
+        out_channels = min(self.channels, int(dev["max_output_channels"]))
+        if out_channels < 1:
+            logger.warning(
+                "Monitor device %d (%s) has no output channels; skipping",
+                self.monitor_device_index, dev["name"],
+            )
+            return
+        try:
+            sd.check_output_settings(
+                device=self.monitor_device_index,
+                samplerate=sample_rate,
+                channels=out_channels,
+                dtype="float32",
+            )
+        except sd.PortAudioError as e:
+            logger.warning(
+                "Monitor device %d (%s) does not accept %d Hz / %d ch; "
+                "skipping monitor: %s",
+                self.monitor_device_index, dev["name"], sample_rate, out_channels, e,
+            )
+            return
+        try:
+            stream = sd.OutputStream(
+                device=self.monitor_device_index,
+                samplerate=sample_rate,
+                channels=out_channels,
+                dtype="float32",
+                blocksize=self.blocksize,
+                callback=self._monitor_callback,
+            )
+            stream.start()
+        except Exception:
+            logger.exception("opening monitor output failed; rip continues without it")
+            return
+        self._monitor_stream = stream
+        logger.info(
+            "Monitor started: device=%d sr=%d ch=%d",
+            self.monitor_device_index, sample_rate, out_channels,
+        )
+
+    def _close_monitor(self) -> None:
+        stream = self._monitor_stream
+        self._monitor_stream = None
+        if stream is None:
+            return
+        try:
+            stream.stop()
+        except Exception:
+            logger.exception("stopping monitor stream failed")
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                logger.exception("closing monitor stream failed")
+            logger.info(
+                "Monitor stopped (dropped_blocks=%d)", self.monitor_dropped,
+            )
 
     def _resolve_sample_rate(self) -> int:
         """Return a sample rate PortAudio will actually accept for this device.
@@ -157,11 +288,17 @@ class CaptureStream:
                 self.channels,
                 self.blocksize,
             )
+            # Open the monitor at the resolved input rate. Order matters:
+            # the rip stream is the source of truth — monitor follows.
+            self._open_monitor(rate)
 
     def stop(self) -> None:
         with self._lock:
             stream = self._stream
             self._stream = None
+        # Close monitor first so its callback stops pulling from the queue
+        # before we tear down the input stream.
+        self._close_monitor()
         if stream is None:
             return
         try:

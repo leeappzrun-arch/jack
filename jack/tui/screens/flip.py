@@ -9,19 +9,29 @@ from textual.widgets import Button, Static
 
 
 class FlipModal(ModalScreen[bool]):
-    """Modal asking the user to flip to Side B. Returns True on confirm."""
+    """Modal asking the user to flip to the next side. Returns True on confirm."""
 
     BINDINGS = [
         Binding("enter", "resume", "Resume", show=True, priority=True),
         Binding("escape", "cancel", "Cancel"),
     ]
 
+    def __init__(self, completed_side: str = "A", next_side: str = "B") -> None:
+        super().__init__()
+        self.completed_side = completed_side
+        self.next_side = next_side
+
     def compose(self) -> ComposeResult:
         with Center():
             with Vertical(id="flip-dialog"):
-                yield Static("Side A complete.", classes="flip-headline")
+                yield Static(
+                    f"Side {self.completed_side} complete.",
+                    classes="flip-headline",
+                )
                 yield Static("")
-                yield Static("Flip the record to Side B, then press Enter.")
+                yield Static(
+                    f"Flip / change the record to Side {self.next_side}, then press Enter."
+                )
                 yield Static("")
                 yield Button("Resume (Enter)", variant="success", id="resume-btn")
 

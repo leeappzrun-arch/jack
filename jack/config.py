@@ -24,6 +24,9 @@ class Config:
     output_dir: str = field(default_factory=_default_output_dir)
     device_index: int | None = None
     device_name: str | None = None
+    # Optional output device for live monitoring during a rip. None = silent.
+    monitor_device_index: int | None = None
+    monitor_device_name: str | None = None
     # None = use the device's native rate (recommended — PortAudio won't
     # resample, so forcing 44100 on a 48 kHz interface fails).
     sample_rate: int | None = None
@@ -32,6 +35,11 @@ class Config:
     silence_threshold_db: float = -45.0
     silence_duration_s: float = 2.5
     min_track_duration_s: float = 20.0
+    # Per-track dynamic minimum: when MB gives us an expected duration, the
+    # detector's min before a split is allowed becomes
+    #   max(min_track_duration_s, expected_seconds * min_track_fraction_of_expected).
+    # Keeps mid-song breakdowns from triggering a false split.
+    min_track_fraction_of_expected: float = 0.85
     # MusicBrainz identity (required by their TOS).
     musicbrainz_contact: str = "jack-vinyl-ripper@localhost"
 

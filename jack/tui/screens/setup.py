@@ -22,10 +22,10 @@ from textual.message import Message
 from textual.screen import Screen
 from textual.widgets import Button, DataTable, Footer, Header, Input, Select, Static
 
-from jack.audio.capture import list_input_devices
+from jack.audio.capture import list_input_devices, list_output_devices
 from jack.metadata import artwork as artwork_mod
 from jack.metadata import musicbrainz as mbz
-from jack.state import RipPhase
+from jack.state import RipPhase, Side
 
 if TYPE_CHECKING:
     from jack.tui.app import JackApp
@@ -66,13 +66,22 @@ class SetupScreen(Screen):
             with Horizontal(classes="row"):
                 yield Static("Album:", classes="label")
                 yield Input(placeholder="e.g. The Dark Side of the Moon", id="album")
-            yield Button("Search MusicBrainz", id="search", variant="primary")
+            with Horizontal(classes="button-row"):
+                yield Button("Search MusicBrainz", id="search", variant="primary")
             yield Static("", id="status")
             table = DataTable(id="results", cursor_type="row", zebra_stripes=True)
             yield table
             with Horizontal(classes="row"):
                 yield Static("Device:", classes="label")
                 yield Select(options=[], prompt="Detecting devices...", id="device")
+            with Horizontal(classes="row"):
+                yield Static("Monitor:", classes="label")
+                yield Select(
+                    options=[],
+                    prompt="(none — rip silently)",
+                    id="monitor",
+                    allow_blank=True,
+                )
             with Horizontal(classes="row"):
                 yield Static("Output:", classes="label")
                 yield Input(id="output")
@@ -83,7 +92,22 @@ class SetupScreen(Screen):
                     placeholder="dB, e.g. -45",
                     tooltip="Silence-detection threshold in dBFS. Lower = ignores more noise.",
                 )
-            yield Button("Begin Ripping", id="begin", variant="success", disabled=True)
+            with Horizontal(classes="row"):
+                yield Static("Gap:", classes="label")
+                yield Input(
+                    id="silence-duration",
+                    placeholder="seconds, e.g. 2.5",
+                    tooltip="How long silence must last to count as an inter-track gap.",
+                )
+            with Horizontal(classes="row"):
+                yield Static("Min track:", classes="label")
+                yield Input(
+                    id="min-track",
+                    placeholder="seconds, e.g. 20",
+                    tooltip="Static floor on track length. Dynamic minimum derived from MB duration overrides this when higher.",
+                )
+            with Horizontal(classes="button-row"):
+                yield Button("Begin Ripping", id="begin", variant="success", disabled=True)
         yield Footer()
 
     # ---- mount setup -----------------------------------------------------
@@ -94,6 +118,8 @@ class SetupScreen(Screen):
         # Output dir + threshold inputs → seed from config
         self.query_one("#output", Input).value = app.config.output_dir
         self.query_one("#threshold", Input).value = f"{app.config.silence_threshold_db:g}"
+        self.query_one("#silence-duration", Input).value = f"{app.config.silence_duration_s:g}"
+        self.query_one("#min-track", Input).value = f"{app.config.min_track_duration_s:g}"
 
         # Device dropdown → populate from sounddevice
         select = self.query_one("#device", Select)
@@ -122,6 +148,26 @@ class SetupScreen(Screen):
                 select.value = preferred
         else:
             select.prompt = "No input devices found"
+
+        # Monitor (output) dropdown — optional live listening during the rip.
+        monitor = self.query_one("#monitor", Select)
+        try:
+            out_devices = list_output_devices()
+        except Exception as e:
+            logger.exception("output device enumeration failed")
+            monitor.prompt = f"monitor error: {e}"
+            out_devices = []
+        if out_devices:
+            monitor.set_options(
+                [
+                    (f"[{d.index}] {d.name}  ({d.max_output_channels}ch, "
+                     f"{d.default_samplerate} Hz)", d.index)
+                    for d in out_devices
+                ]
+            )
+            preferred_mon = app.config.monitor_device_index
+            if preferred_mon is not None and preferred_mon in {d.index for d in out_devices}:
+                monitor.value = preferred_mon
 
         # DataTable columns
         table = self.query_one("#results", DataTable)
@@ -253,10 +299,15 @@ class SetupScreen(Screen):
 
     def _on_release_loaded(self, details: mbz.ReleaseDetails) -> None:
         self._details = details
-        sides = "/".join(details.sides) if details.sides else "(no side info — will prompt)"
-        side_a = details.side_a_count if details.side_a_count else "?"
+        if details.sides and details.side_counts:
+            sides_str = ", ".join(
+                f"{s}:{n}" for s, n in zip(details.sides, details.side_counts)
+            )
+            sides_summary = f"sides: {sides_str}"
+        else:
+            sides_summary = "sides: (no info — will prompt)"
         self._set_status(
-            f"Loaded {len(details.tracks)} tracks  •  sides: {sides}  •  side A: {side_a}"
+            f"Loaded {len(details.tracks)} tracks  •  {sides_summary}"
             "  •  Fetching artwork…"
         )
         self._refresh_begin()
@@ -326,14 +377,52 @@ class SetupScreen(Screen):
             )
             return
 
+        gap_value = self.query_one("#silence-duration", Input).value.strip()
+        try:
+            silence_duration_s = float(gap_value)
+        except ValueError:
+            self._set_status(f"Gap must be a number of seconds, got “{gap_value}”.")
+            return
+        if not (0.3 <= silence_duration_s <= 10.0):
+            self._set_status(
+                f"Gap {silence_duration_s:g}s out of range (use 0.3 .. 10)."
+            )
+            return
+
+        min_value = self.query_one("#min-track", Input).value.strip()
+        try:
+            min_track_duration_s = float(min_value)
+        except ValueError:
+            self._set_status(f"Min track must be a number of seconds, got “{min_value}”.")
+            return
+        if not (5.0 <= min_track_duration_s <= 600.0):
+            self._set_status(
+                f"Min track {min_track_duration_s:g}s out of range (use 5 .. 600)."
+            )
+            return
+
         # Persist user choices to config.
         app.config.silence_threshold_db = threshold_db
+        app.config.silence_duration_s = silence_duration_s
+        app.config.min_track_duration_s = min_track_duration_s
         app.config.device_index = int(device_value)
         # Look up the friendly name for display later.
         for d in list_input_devices():
             if d.index == app.config.device_index:
                 app.config.device_name = d.name
                 break
+
+        monitor_value = self.query_one("#monitor", Select).value
+        if monitor_value is Select.BLANK:
+            app.config.monitor_device_index = None
+            app.config.monitor_device_name = None
+        else:
+            app.config.monitor_device_index = int(monitor_value)
+            for d in list_output_devices():
+                if d.index == app.config.monitor_device_index:
+                    app.config.monitor_device_name = d.name
+                    break
+
         app.config.output_dir = str(output_path)
         app.config.save()
 
@@ -344,7 +433,11 @@ class SetupScreen(Screen):
         app.state.date = details.date
         app.state.mbid = details.mbid
         app.state.tracks = mbz.to_app_tracks(details)
-        app.state.side_a_count = details.side_a_count
+        app.state.sides_order = [Side(s) for s in details.sides if s in Side.__members__]
+        app.state.side_counts = list(details.side_counts)
+        # Initial recording side = the first track's side.
+        if app.state.tracks:
+            app.state.side = app.state.tracks[0].side
         app.state.phase = RipPhase.SETUP
         app.state.current_track_index = 0
         if app.artwork is not None:

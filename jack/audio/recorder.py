@@ -38,7 +38,14 @@ from jack.audio.encoder import (
 )
 from jack.audio.silence import SilenceDetector, block_rms_db
 from jack.metadata.artwork import Artwork
-from jack.state import AppState, Side, Track, TrackStatus
+from jack.state import (
+    AppState,
+    Side,
+    Track,
+    TrackStatus,
+    disc_for_side,
+    total_discs_for_sides,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +57,9 @@ class EventKind(str, Enum):
     READY = "ready"                  # capture started, listening
     TRACK_STARTED = "track_started"  # detector saw audio, recording into temp WAV
     TRACK_FINISHED = "track_finished"  # FLAC encode complete (or failed)
-    SIDE_A_COMPLETE = "side_a_complete"  # expected side-A track count hit
+    SIDE_COMPLETE = "side_complete"  # expected track count for current side hit
     PAUSED = "paused"                # capture paused (waiting for flip)
-    RESUMED = "resumed"              # capture resumed (side B)
+    RESUMED = "resumed"              # capture resumed (next side)
     STOPPED = "stopped"              # capture stopped (user quit / done)
     ERROR = "error"
 
@@ -64,6 +71,9 @@ class ControllerEvent:
     message: str | None = None
     output_path: Path | None = None
     actual_duration_ms: int | None = None
+    # For SIDE_COMPLETE: the side that just finished and the one to flip to.
+    completed_side: Side | None = None
+    next_side: Side | None = None
 
 
 class RipController:
@@ -76,9 +86,11 @@ class RipController:
         device_index: int,
         sample_rate: int | None,
         channels: int,
+        monitor_device_index: int | None,
         threshold_db: float,
         silence_duration_s: float,
         min_track_duration_s: float,
+        min_track_fraction_of_expected: float,
         output_dir: Path,
         artwork: Artwork | None,
         on_event,
@@ -87,11 +99,14 @@ class RipController:
         self.output_dir = output_dir
         self.artwork = artwork
         self._on_event = on_event
+        self._static_min_track_s = min_track_duration_s
+        self._min_fraction_of_expected = min_track_fraction_of_expected
 
         self._stream = CaptureStream(
             device_index,
             sample_rate=sample_rate,
             channels=channels,
+            monitor_device_index=monitor_device_index,
         )
         # The detector instance is replaced after a side flip so PRE_ROLL is fresh.
         self._detector_kwargs = dict(
@@ -144,10 +159,16 @@ class RipController:
     def pause(self) -> None:
         self._paused.set()
 
-    def resume_for_side_b(self) -> None:
-        """Reset the detector and continue recording, now on Side B."""
+    def resume_next_side(self) -> None:
+        """Advance to the next side, reset detector, resume recording.
+
+        The next side is derived from the track we're about to record: each
+        track's `side` was assigned by the MB adapter, so we just read it.
+        """
+        track = self.state.current_track()
         with self.state.lock:
-            self.state.side = Side.B
+            if track is not None:
+                self.state.side = track.side
         if self._detector is not None:
             self._detector.reset()
         self._paused.clear()
@@ -221,6 +242,15 @@ class RipController:
             logger.exception("failed to open temp WAV")
             self._emit(EventKind.ERROR, message=str(e))
             return
+        # Tune the detector's per-track minimum from MB's expected duration so
+        # mid-song silences don't trigger a false split. If MB has no duration,
+        # the static floor still applies.
+        if self._detector is not None:
+            expected_s = (track.duration_ms or 0) / 1000.0
+            dynamic_min = expected_s * self._min_fraction_of_expected
+            self._detector.min_track_duration_s = max(
+                self._static_min_track_s, dynamic_min
+            )
         with self.state.lock:
             track.status = TrackStatus.RECORDING
         self._emit(EventKind.TRACK_STARTED, track_index=self._current_index())
@@ -240,7 +270,6 @@ class RipController:
             track.status = TrackStatus.ENCODING
             track.actual_duration_ms = actual_duration_ms
             current_idx = self.state.current_track_index
-            side_a_count = self.state.side_a_count
 
         # Submit the encode in the background so the worker can keep reading the queue.
         fut = self._encoder_pool.submit(
@@ -253,11 +282,27 @@ class RipController:
         with self.state.lock:
             self.state.current_track_index = current_idx + 1
             new_idx = self.state.current_track_index
-            still_side_a = side_a_count is not None and new_idx < side_a_count
+            boundaries = self.state.side_boundaries()
+            total_tracks = len(self.state.tracks)
+            completed_side = self.state.tracks[current_idx].side
+            next_side = (
+                self.state.tracks[new_idx].side if new_idx < total_tracks else None
+            )
 
-        if side_a_count is not None and new_idx == side_a_count:
-            self._emit(EventKind.SIDE_A_COMPLETE, track_index=current_idx)
-        elif new_idx >= len(self.state.tracks):
+        # SIDE_COMPLETE fires at every internal boundary (i.e. not the final one).
+        # The detector hasn't seen audio yet for the next side — the flip flow
+        # will pause capture and reset the detector before any of that matters.
+        at_internal_boundary = (
+            new_idx in boundaries and new_idx < total_tracks
+        )
+        if at_internal_boundary:
+            self._emit(
+                EventKind.SIDE_COMPLETE,
+                track_index=current_idx,
+                completed_side=completed_side,
+                next_side=next_side,
+            )
+        elif new_idx >= total_tracks:
             # All expected tracks captured — stop on the UI side.
             self._stop.set()
 
@@ -265,14 +310,21 @@ class RipController:
         """Runs on the encoder pool. Updates state + emits TRACK_FINISHED."""
         try:
             track = self.state.tracks[track_index]
+            disc_no = disc_for_side(track.side)
+            total_discs = total_discs_for_sides(self.state.sides_order) or 1
+            # Per-disc track number (1..N within the disc) is friendlier in tags
+            # than a global 1..total — e.g. disc 2 track 1 instead of track 11.
+            tracknumber, totaltracks = _disc_local_numbering(
+                self.state, track_index, disc_no
+            )
             metadata = TrackMetadata(
                 artist=self.state.artist,
                 album=self.state.album,
                 title=track.title or f"Track {track.number}",
-                tracknumber=track.number,
-                totaltracks=len(self.state.tracks),
-                discnumber=1,
-                totaldiscs=1,
+                tracknumber=tracknumber,
+                totaltracks=totaltracks,
+                discnumber=disc_no,
+                totaldiscs=total_discs,
                 date=_year_of(self.state.date),
                 albumartist=self.state.artist,
             )
@@ -348,6 +400,25 @@ class RipController:
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+
+def _disc_local_numbering(state: AppState, track_index: int, disc_no: int) -> tuple[int, int]:
+    """Return (tracknumber, totaltracks) scoped to the disc this track is on.
+
+    If sides_order is empty (single-side, no MB info), the album is treated
+    as one disc and we just use the global 1..N numbering.
+    """
+    if not state.sides_order:
+        return track_index + 1, len(state.tracks)
+    on_disc = [
+        i for i, t in enumerate(state.tracks)
+        if disc_for_side(t.side) == disc_no
+    ]
+    try:
+        local = on_disc.index(track_index) + 1
+    except ValueError:
+        local = track_index + 1
+    return local, len(on_disc)
 
 
 def _year_of(date: str) -> str:

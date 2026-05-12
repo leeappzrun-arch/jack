@@ -128,7 +128,11 @@ async def main() -> int:
     app.state.date = details.date
     app.state.mbid = details.mbid
     app.state.tracks = mbz.to_app_tracks(details)
-    app.state.side_a_count = details.side_a_count
+    from jack.state import Side as _Side
+    app.state.sides_order = [_Side(s) for s in details.sides if s in _Side.__members__]
+    app.state.side_counts = list(details.side_counts)
+    if app.state.tracks:
+        app.state.side = app.state.tracks[0].side
     app.artwork = None  # exercise the fallback artwork path
 
     async with app.run_test(size=(140, 40)) as pilot:

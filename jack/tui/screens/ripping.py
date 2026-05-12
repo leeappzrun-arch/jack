@@ -18,6 +18,7 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from rich.text import Text
 from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -33,7 +34,7 @@ from jack.metadata.artwork import (
     fallback_art,
     render_with_chafa,
 )
-from jack.state import Side, Track, TrackStatus
+from jack.state import TrackStatus
 from jack.tui.screens.complete import CompletionScreen
 from jack.tui.screens.flip import FlipModal
 
@@ -157,7 +158,7 @@ class RippingScreen(Screen):
         yield VUMeter(id="vu")
         with Horizontal(id="progress-row"):
             with Vertical(classes="progress-col"):
-                yield Static("Track", classes="progress-label")
+                yield Static("Track", classes="progress-label", id="track-progress-label")
                 yield ProgressBar(total=100, show_eta=False, show_percentage=True, id="track-progress")
             with Vertical(classes="progress-col"):
                 yield Static("Overall", classes="progress-label")
@@ -202,9 +203,11 @@ class RippingScreen(Screen):
             device_index=app.config.device_index,
             sample_rate=app.config.sample_rate,
             channels=app.config.channels,
+            monitor_device_index=app.config.monitor_device_index,
             threshold_db=app.config.silence_threshold_db,
             silence_duration_s=app.config.silence_duration_s,
             min_track_duration_s=app.config.min_track_duration_s,
+            min_track_fraction_of_expected=app.config.min_track_fraction_of_expected,
             output_dir=Path(app.config.output_dir),
             artwork=app.artwork,
             on_event=self._on_controller_event,
@@ -242,7 +245,10 @@ class RippingScreen(Screen):
         widget = self.query_one("#artwork", Static)
         if app.artwork is not None and chafa_available():
             try:
-                widget.update(render_with_chafa(app.artwork.image_path, width=24, height=12))
+                # chafa emits raw ANSI escapes; Text.from_ansi parses them into
+                # Rich style spans so they render as colors, not visible text.
+                ansi = render_with_chafa(app.artwork.image_path, width=24, height=12)
+                widget.update(Text.from_ansi(ansi))
                 return
             except Exception:
                 logger.exception("chafa render failed")
@@ -266,6 +272,7 @@ class RippingScreen(Screen):
         app: "JackApp" = self.app  # type: ignore[assignment]
         track = app.state.current_track()
         track_bar = self.query_one("#track-progress", ProgressBar)
+        track_label = self.query_one("#track-progress-label", Static)
         if track is not None and track.status == TrackStatus.RECORDING and track.duration_ms:
             # The writer's frame count is the source of truth for actual elapsed
             # length, but we don't have a stable handle to it here. Use a wall-
@@ -274,8 +281,17 @@ class RippingScreen(Screen):
             elapsed_ms = int((time.monotonic() - (self._track_started_at or time.monotonic())) * 1000)
             pct = min(100, int(elapsed_ms / track.duration_ms * 100))
             track_bar.update(total=100, progress=pct)
+            track_label.update(
+                f"Track  {_fmt_dur(elapsed_ms).strip()} / {_fmt_dur(track.duration_ms).strip()}"
+            )
+        elif track is not None and track.status == TrackStatus.RECORDING:
+            # Recording but MB had no expected duration — show elapsed only.
+            import time
+            elapsed_ms = int((time.monotonic() - (self._track_started_at or time.monotonic())) * 1000)
+            track_label.update(f"Track  {_fmt_dur(elapsed_ms).strip()}")
         elif track is None or track.status == TrackStatus.WAITING:
             track_bar.update(total=100, progress=0)
+            track_label.update("Track")
 
     # ---- controller event bridge ----------------------------------------
 
@@ -309,9 +325,16 @@ class RippingScreen(Screen):
                     f"Wrote track {ev.track_index + 1} ({_fmt_dur(ev.actual_duration_ms)})"
                 )
             self._maybe_transition_to_completion()
-        elif ev.kind == EventKind.SIDE_A_COMPLETE:
-            self._set_status("Side A complete — pausing for record flip.")
-            self._begin_flip_flow()
+        elif ev.kind == EventKind.SIDE_COMPLETE:
+            completed = ev.completed_side.value if ev.completed_side else "?"
+            next_side = ev.next_side.value if ev.next_side else "?"
+            self._set_status(
+                f"Side {completed} complete — pausing to change to Side {next_side}."
+            )
+            self._begin_flip_flow(
+                completed_side=completed,
+                next_side=next_side,
+            )
         elif ev.kind == EventKind.PAUSED:
             self._set_status("Paused.")
         elif ev.kind == EventKind.RESUMED:
@@ -390,27 +413,54 @@ class RippingScreen(Screen):
 
     # ---- flip flow ------------------------------------------------------
 
-    def _begin_flip_flow(self) -> None:
+    def _begin_flip_flow(
+        self,
+        completed_side: str | None = None,
+        next_side: str | None = None,
+    ) -> None:
         if self._controller is None:
             return
         self._controller.pause()
+
+        # Derive sides from state if the caller didn't supply them (manual flip).
+        app: "JackApp" = self.app  # type: ignore[assignment]
+        if completed_side is None:
+            completed_side = app.state.side.value
+        if next_side is None:
+            idx = app.state.current_track_index
+            if 0 <= idx < len(app.state.tracks):
+                next_side = app.state.tracks[idx].side.value
+            else:
+                next_side = completed_side
 
         def _after(resumed: bool) -> None:
             if not resumed:
                 return
             if self._controller is None:
                 return
-            self._controller.resume_for_side_b()
+            self._controller.resume_next_side()
+            self._update_side_label()
 
-        self.app.push_screen(FlipModal(), _after)
+        self.app.push_screen(
+            FlipModal(completed_side=completed_side, next_side=next_side),
+            _after,
+        )
 
     # ---- actions --------------------------------------------------------
 
     def action_toggle_pause(self) -> None:
         if self._controller is None:
             return
-        if self.app.state.side == Side.A and self.app.state.side_a_count and \
-                self.app.state.current_track_index >= self.app.state.side_a_count:
+        # When awaiting a side change, the FlipModal owns the pause/resume.
+        # Detect that as: the controller is paused AND the modal is up — i.e.
+        # state.side hasn't yet been advanced to the next track's side.
+        app: "JackApp" = self.app  # type: ignore[assignment]
+        idx = app.state.current_track_index
+        if (
+            self._controller._paused.is_set()
+            and 0 <= idx < len(app.state.tracks)
+            and app.state.tracks[idx].side != app.state.side
+        ):
             return
         # Simple toggle — internally setting/clearing the paused event.
         if self._controller._paused.is_set():

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jack"
-version = "0.1.0"
+version = "0.2.0"
 description = "TUI vinyl ripper: capture, auto-split, tag, and encode records to FLAC."
 readme = { content-type = "text/markdown", text = "Jack — vinyl-to-FLAC TUI ripper." }
 requires-python = ">=3.11"

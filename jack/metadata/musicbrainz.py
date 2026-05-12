@@ -99,10 +99,15 @@ class ReleaseDetails:
     date: str
     format: str | None
     tracks: list[MBTrack] = field(default_factory=list)
-    # Number of tracks on side A. None means we couldn't derive it.
-    side_a_count: int | None = None
-    # Earliest side letter seen (usually "A"). Used when computing side B start.
+    # Sides seen, in order ("A","B","C","D",...). Empty if MB had no side info.
     sides: list[str] = field(default_factory=list)
+    # Track count per side, parallel to `sides`. Empty when sides is empty.
+    side_counts: list[int] = field(default_factory=list)
+
+    @property
+    def side_a_count(self) -> int | None:
+        """Back-compat shim. Tracks on the first side (None if unknown)."""
+        return self.side_counts[0] if self.side_counts else None
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +262,7 @@ def parse_release(result: dict[str, Any]) -> ReleaseDetails:
                 )
             )
 
-    side_a_count = _derive_side_a_count(tracks, sides_seen)
+    side_counts = _derive_side_counts(tracks, sides_seen)
     return ReleaseDetails(
         mbid=mbid,
         artist=artist,
@@ -265,8 +270,8 @@ def parse_release(result: dict[str, Any]) -> ReleaseDetails:
         date=date,
         format=fmt,
         tracks=tracks,
-        side_a_count=side_a_count,
         sides=sides_seen,
+        side_counts=side_counts,
     )
 
 
@@ -275,14 +280,17 @@ def _parse_side(number: str) -> str | None:
     return m.group(1).upper() if m else None
 
 
-def _derive_side_a_count(tracks: list[MBTrack], sides: list[str]) -> int | None:
-    """If every track has a side letter, return the count for the first side."""
+def _derive_side_counts(tracks: list[MBTrack], sides: list[str]) -> list[int]:
+    """Per-side track counts (parallel to `sides`). Empty if any track lacks side info."""
     if not tracks or not sides:
-        return None
+        return []
     if any(t.side is None for t in tracks):
-        return None
-    first_side = sides[0]
-    return sum(1 for t in tracks if t.side == first_side)
+        return []
+    counts_by_side: dict[str, int] = {s: 0 for s in sides}
+    for t in tracks:
+        if t.side in counts_by_side:
+            counts_by_side[t.side] += 1
+    return [counts_by_side[s] for s in sides]
 
 
 # ---------------------------------------------------------------------------
@@ -290,19 +298,19 @@ def _derive_side_a_count(tracks: list[MBTrack], sides: list[str]) -> int | None:
 # ---------------------------------------------------------------------------
 
 
-def to_app_tracks(details: ReleaseDetails, side_a_count: int | None = None) -> list[Track]:
+def to_app_tracks(details: ReleaseDetails) -> list[Track]:
     """Convert MB tracks to `jack.state.Track` objects.
 
-    `side_a_count` overrides the derived value (used when the user pins the
-    split manually via the setup screen). If still unknown, all tracks are
-    placed on Side A — the UI will warn and prompt during the flip step.
+    Each track keeps the side letter MB gave us (A/B/C/D/...). If MB had no
+    side info, every track lands on Side A and the UI runs as a single side.
     """
-    cutoff = side_a_count if side_a_count is not None else details.side_a_count
     out: list[Track] = []
     for t in details.tracks:
-        if cutoff is not None and t.position > cutoff:
-            side = Side.B
-        else:
+        try:
+            side = Side(t.side) if t.side else Side.A
+        except ValueError:
+            # Side letter beyond what the enum knows (shouldn't happen for
+            # standard A–F vinyl). Fall back to A so the rip can still run.
             side = Side.A
         out.append(
             Track(

@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from rich.text import Text
 from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -79,7 +80,8 @@ class CompletionScreen(Screen):
         art = self.query_one("#complete-artwork", Static)
         if app.artwork is not None and chafa_available():
             try:
-                art.update(render_with_chafa(app.artwork.image_path, width=24, height=12))
+                ansi = render_with_chafa(app.artwork.image_path, width=24, height=12)
+                art.update(Text.from_ansi(ansi))
             except Exception:
                 logger.exception("chafa render failed in completion screen")
                 art.update(fallback_art())
