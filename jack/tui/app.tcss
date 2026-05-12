@@ -1,3 +1,59 @@
+/* ----- Main menu ----- */
+
+MainMenuScreen {
+    align: center middle;
+}
+
+#menu-logo {
+    color: $accent;
+    text-style: bold;
+    height: auto;
+    content-align: center middle;
+    margin: 0 0 1 0;
+}
+
+#menu-tagline {
+    color: $text-muted;
+    height: 1;
+    content-align: center middle;
+    margin: 0 0 2 0;
+}
+
+#menu-buttons {
+    width: 32;
+    height: auto;
+    align-horizontal: center;
+}
+
+#menu-buttons Button {
+    width: 100%;
+    margin: 0 0 1 0;
+}
+
+/* ----- Test screen ----- */
+
+TestScreen {
+    layout: vertical;
+}
+
+#test-grid {
+    padding: 1 2;
+    height: auto;
+}
+
+#test-help {
+    height: auto;
+    color: $text-muted;
+    margin: 0 0 1 0;
+}
+
+#test-status {
+    height: 1;
+    padding: 0 0;
+    color: $warning;
+    margin: 1 0;
+}
+
 /* Setup screen layout */
 
 SetupScreen {

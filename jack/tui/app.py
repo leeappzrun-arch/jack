@@ -14,8 +14,10 @@ from textual.app import App
 
 from jack.config import Config
 from jack.state import AppState
+from jack.tui.screens.menu import MainMenuScreen
 from jack.tui.screens.ripping import RippingScreen
 from jack.tui.screens.setup import SetupScreen
+from jack.tui.screens.test import TestScreen
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +44,16 @@ class JackApp(App):
         self.use_fixture = os.environ.get("JACK_USE_FIXTURE") == "1"
 
     def on_mount(self) -> None:
+        self.push_screen(MainMenuScreen())
+
+    def on_main_menu_screen_start_test(self, _message: MainMenuScreen.StartTest) -> None:
+        self.push_screen(TestScreen())
+
+    def on_main_menu_screen_start_rip(self, _message: MainMenuScreen.StartRip) -> None:
         self.push_screen(SetupScreen())
+
+    def on_test_screen_back(self, _message: TestScreen.Back) -> None:
+        self.pop_screen()
 
     def on_setup_screen_begin_ripping(self, _message: SetupScreen.BeginRipping) -> None:
         self.push_screen(RippingScreen())

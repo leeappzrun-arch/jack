@@ -13,7 +13,6 @@ UI orchestration:
 from __future__ import annotations
 
 import logging
-import math
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -23,7 +22,6 @@ from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.reactive import reactive
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, ProgressBar, Static
 
@@ -37,6 +35,7 @@ from jack.metadata.artwork import (
 from jack.state import TrackStatus
 from jack.tui.screens.complete import CompletionScreen
 from jack.tui.screens.flip import FlipModal
+from jack.tui.widgets.vu import VUMeter
 
 if TYPE_CHECKING:
     from jack.tui.app import JackApp
@@ -57,68 +56,6 @@ def _fmt_dur(ms: int | None) -> str:
         return "  --"
     s = ms // 1000
     return f"{s // 60:>2}:{s % 60:02d}"
-
-
-# ---------------------------------------------------------------------------
-# Custom VU widget
-# ---------------------------------------------------------------------------
-
-
-class VUMeter(Static):
-    """Horizontal text VU. Update via `set_levels(rms_db, peak_db)`."""
-
-    DEFAULT_CSS = """
-    VUMeter {
-        height: 3;
-        padding: 0 2;
-        content-align: left middle;
-    }
-    """
-
-    rms_db = reactive(-math.inf, layout=False)
-    peak_db = reactive(-math.inf, layout=False)
-
-    FLOOR_DB = -60.0
-    WIDTH = 50
-
-    def set_levels(self, rms_db: float, peak_db: float) -> None:
-        self.rms_db = rms_db
-        self.peak_db = peak_db
-
-    def watch_rms_db(self, _old: float, _new: float) -> None:
-        self.refresh()
-
-    def watch_peak_db(self, _old: float, _new: float) -> None:
-        self.refresh()
-
-    def render(self) -> str:
-        def cells(db: float) -> int:
-            if not math.isfinite(db):
-                return 0
-            frac = (db - self.FLOOR_DB) / (-self.FLOOR_DB)
-            return max(0, min(self.WIDTH, int(frac * self.WIDTH)))
-
-        rms_n = cells(self.rms_db)
-        peak_n = cells(self.peak_db)
-        # Two-layer bar: solid for RMS, lighter for peak hold.
-        bar_chars: list[str] = []
-        for i in range(self.WIDTH):
-            if i < rms_n:
-                # Color gradient via Rich markup: green, yellow, red zones.
-                if i >= int(self.WIDTH * 0.85):
-                    bar_chars.append("[red]█[/]")
-                elif i >= int(self.WIDTH * 0.7):
-                    bar_chars.append("[yellow]█[/]")
-                else:
-                    bar_chars.append("[green]█[/]")
-            elif i < peak_n:
-                bar_chars.append("[white]▏[/]")
-            else:
-                bar_chars.append("·")
-        bar = "".join(bar_chars)
-        rms_s = f"{self.rms_db:+6.1f}" if math.isfinite(self.rms_db) else "  -inf"
-        peak_s = f"{self.peak_db:+6.1f}" if math.isfinite(self.peak_db) else "  -inf"
-        return f"VU  {bar}  peak {peak_s} dB  rms {rms_s} dB"
 
 
 # ---------------------------------------------------------------------------
