@@ -122,6 +122,7 @@ class RipController:
 
         self._stop = threading.Event()
         self._paused = threading.Event()
+        self._force_split = threading.Event()
         self._worker_thread: threading.Thread | None = None
 
         # VU state, written by worker thread, read by UI timer.
@@ -158,6 +159,14 @@ class RipController:
 
     def pause(self) -> None:
         self._paused.set()
+
+    def force_split(self) -> None:
+        """Request a manual track boundary at the next worker iteration.
+
+        Used for gapless transitions where silence detection never fires.
+        No-op if paused or not currently recording a track.
+        """
+        self._force_split.set()
 
     def resume_next_side(self) -> None:
         """Advance to the next side, reset detector, resume recording.
@@ -203,6 +212,15 @@ class RipController:
 
             if self._paused.is_set():
                 continue
+
+            if self._force_split.is_set():
+                self._force_split.clear()
+                try:
+                    for ev in self._detector.force_split():
+                        self._dispatch(ev)
+                except Exception as e:
+                    logger.exception("detector.force_split failed")
+                    self._emit(EventKind.ERROR, message=str(e))
 
             try:
                 events = self._detector.feed(block)

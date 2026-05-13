@@ -182,6 +182,27 @@ class SilenceDetector:
         self._state = DetectorState.PRE_ROLL
         return events
 
+    def force_split(self) -> list[DetectorEvent]:
+        """Manually end the current track and start a new one immediately.
+
+        For gapless transitions where the silence detector won't trigger.
+        Any buffered trailing silence is discarded (treated as inter-track
+        even though it never crossed the duration threshold). The new track
+        starts in RECORDING state so the next block lands in it directly.
+        """
+        events: list[DetectorEvent] = []
+        if self._state is DetectorState.PRE_ROLL:
+            return events
+        if self._track_frames == 0 and not self._silence_buf:
+            return events
+        events.append(DetectorEvent("track_end"))
+        self._silence_buf.clear()
+        self._silence_frames = 0
+        self._track_frames = 0
+        events.append(DetectorEvent("track_start"))
+        self._state = DetectorState.RECORDING
+        return events
+
     def reset(self) -> None:
         """Hard reset — discards in-flight state without emitting events."""
         self._silence_buf.clear()

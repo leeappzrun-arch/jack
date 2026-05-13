@@ -68,6 +68,7 @@ class RippingScreen(Screen):
 
     BINDINGS = [
         Binding("p", "toggle_pause", "Pause / Resume"),
+        Binding("n", "force_split", "Next Track"),
         Binding("f", "force_flip", "Flip Record"),
         Binding("q", "quit_rip", "Stop & Quit"),
     ]
@@ -78,6 +79,7 @@ class RippingScreen(Screen):
         self._vu_timer = None
         self._track_started_at: float | None = None
         self._transitioned = False  # guard against double-pushing CompletionScreen
+        self._end_alert_fired = False  # one bell per track
 
     # ---- compose --------------------------------------------------------
 
@@ -221,6 +223,13 @@ class RippingScreen(Screen):
             track_label.update(
                 f"Track  {_fmt_dur(elapsed_ms).strip()} / {_fmt_dur(track.duration_ms).strip()}"
             )
+            remaining_ms = track.duration_ms - elapsed_ms
+            if not self._end_alert_fired and 0 < remaining_ms <= 20_000:
+                self._end_alert_fired = True
+                self.app.bell()
+                self._set_status(
+                    "[yellow]20s left — press [b]n[/b] now if the next track is gapless.[/]"
+                )
         elif track is not None and track.status == TrackStatus.RECORDING:
             # Recording but MB had no expected duration — show elapsed only.
             import time
@@ -250,6 +259,7 @@ class RippingScreen(Screen):
         elif ev.kind == EventKind.TRACK_STARTED:
             import time
             self._track_started_at = time.monotonic()
+            self._end_alert_fired = False
             self._refresh_track_row(ev.track_index)
             self._set_status(f"Recording track {ev.track_index + 1}")
         elif ev.kind == EventKind.TRACK_FINISHED:
@@ -259,7 +269,7 @@ class RippingScreen(Screen):
                 self._set_status(f"[yellow]Track {ev.track_index + 1} error: {ev.message}[/]")
             else:
                 self._set_status(
-                    f"Wrote track {ev.track_index + 1} ({_fmt_dur(ev.actual_duration_ms)})"
+                    f"Wrote track {ev.track_index + 1} ({_fmt_dur(ev.actual_duration_ms).strip()})"
                 )
             self._maybe_transition_to_completion()
         elif ev.kind == EventKind.SIDE_COMPLETE:
@@ -405,6 +415,15 @@ class RippingScreen(Screen):
             self._set_status("Resumed.")
         else:
             self._controller.pause()
+
+    def action_force_split(self) -> None:
+        """Manual track split for gapless transitions where silence detection won't fire."""
+        if self._controller is None:
+            return
+        if self._controller._paused.is_set():
+            return
+        self._controller.force_split()
+        self._set_status("Manual split — starting next track.")
 
     def action_force_flip(self) -> None:
         """Manual side flip (used when MB had no side info)."""
